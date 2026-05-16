@@ -1,12 +1,13 @@
 import Papa from "papaparse";
-import { runPipeline } from "./firmsClusterEngine.js";
+import { normalizeRow, parseAcqMs, runPipeline } from "./firmsClusterEngine.js";
 
 /**
  * FIRMS CSV base URL — default aligns with FIRMS US/Canada portal (USFS gateway).
  *
- * Desired shape (DATE optional via env; default = today UTC appended):
- *   /usfs/api/area/csv/[MAP_KEY]/VIIRS_SNPP_NRT/world/[DAY_RANGE]/[YYYY-MM-DD]
- * Docs: https://firms.modaps.eosdis.nasa.gov/usfs/api/area/
+ * Two parallel VIIRS pulls (NOAA-20 primary, NOAA-21 secondary), row merge with
+ * spatial dedupe keeping the newest acquisition (`acq_date`/`acq_time`; NOAA-20 breaks ties).
+ * Path shape:
+ *   /usfs/api/area/csv/[MAP_KEY]/VIIRS_NOAA20_NRT|VIIRS_NOAA21_NRT/[AREA]/[DAY_RANGE]/[DATE?]
  *
  * Override base e.g. global gateway:
  *   VITE_FIRMS_AREA_CSV_BASE=https://firms.modaps.eosdis.nasa.gov/api/area/csv
@@ -24,6 +25,9 @@ const GEO_INTER_MS_NOMINATIM = 1100;
 let reverseGeocodeProviderProbePromise = null;
 
 const LOG_PREFIX = "[FireSync FIRMS]";
+
+const FIRMS_VIIRS_PRIMARY = "VIIRS_NOAA20_NRT";
+const FIRMS_VIIRS_SECONDARY = "VIIRS_NOAA21_NRT";
 
 /**
  * Bounding box west,south,east,north: US (+AK/HI) + Canada. FIRMS also accepts literal `world`.
@@ -110,6 +114,107 @@ function resolveFirmsDateUrlSuffixUTC() {
   const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
   const da = String(d.getUTCDate()).padStart(2, "0");
   return `/${y}-${mo}-${da}`;
+}
+
+function buildFirmsAreaCsvUrl(csvBase, mapKey, viirsSource, bbox, dayRange, dateSuffix) {
+  return `${csvBase}/${encodeURIComponent(mapKey)}/${viirsSource}/${bbox}/${dayRange}${dateSuffix}`;
+}
+
+function spatialDedupeKey(norm) {
+  const lat = parseFloat(norm.latitude);
+  const lng = parseFloat(norm.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const rl = Math.round(lat * 10000) / 10000;
+  const rn = Math.round(lng * 10000) / 10000;
+  return `${rl},${rn}`;
+}
+
+function emptyPapaCsv() {
+  return { data: [], meta: { fields: [] }, errors: [] };
+}
+
+/**
+ * NOAA-20 = tier 0 (primary), NOAA-21 = tier 1. Same rounded lat/lng (4 decimals):
+ * keep newest acquisition; on equal timestamp prefer NOAA-20.
+ */
+function mergeNoaaViirsDualParsed(parsedPrimary, parsedSecondary) {
+  const fields = [
+    ...new Set([...(parsedPrimary.meta.fields || []), ...(parsedSecondary.meta.fields || [])]),
+  ];
+  const rowsP = parsedPrimary.data || [];
+  const rowsS = parsedSecondary.data || [];
+  const totalIn = rowsP.length + rowsS.length;
+
+  const items = [];
+  for (const r of rowsP) items.push({ raw: r, tier: 0 });
+  for (const r of rowsS) items.push({ raw: r, tier: 1 });
+
+  for (const it of items) {
+    const norm = normalizeRow(it.raw);
+    const ms = parseAcqMs(norm.acq_date, norm.acq_time);
+    it.ms = ms;
+    it.key = spatialDedupeKey(norm);
+  }
+
+  items.sort((a, b) => {
+    if (b.ms !== a.ms) return b.ms - a.ms;
+    return a.tier - b.tier;
+  });
+
+  const out = [];
+  const seen = new Set();
+  let droppedDup = 0;
+  let droppedNoKey = 0;
+  for (const it of items) {
+    if (!it.key) {
+      droppedNoKey++;
+      continue;
+    }
+    if (seen.has(it.key)) {
+      droppedDup++;
+      continue;
+    }
+    seen.add(it.key);
+    out.push(it.raw);
+  }
+
+  const csvText = Papa.unparse(out, { columns: fields });
+  return {
+    csvText,
+    stats: {
+      totalIn,
+      kept: out.length,
+      droppedDuplicate: droppedDup,
+      droppedNoCoordinates: droppedNoKey,
+      fromPrimary: rowsP.length,
+      fromSecondary: rowsS.length,
+    },
+  };
+}
+
+/** Lighter logs for the secondary satellite CSV (avoid duplicating raw 2.5k dumps). */
+function logCsvPayloadCompact(csvText, res, mapKey, label) {
+  const headersObj = {};
+  res.headers.forEach((v, k) => {
+    headersObj[k] = v;
+  });
+  console.log(`${LOG_PREFIX} ——— FETCH RESPONSE META (${label}) ———`, {
+    ok: res.ok,
+    status: res.status,
+    statusText: res.statusText,
+    url: redactKeyInUrl(res.url || "", mapKey),
+    headers: headersObj,
+  });
+  const shape = inspectCsvText(csvText);
+  console.log(`${LOG_PREFIX} ——— CSV STRUCTURE (${label}) ———`, shape);
+  const sniff = Papa.parse(csvText, { header: true, preview: 8, skipEmptyLines: true });
+  console.log(`${LOG_PREFIX} ——— PAPA PARSE SNIFF (${label}) ———`, {
+    delimiter: sniff.meta?.delimiter,
+    linebreak: sniff.meta?.linebreak,
+    fields: sniff.meta?.fields,
+    previewRowObjects: sniff.data,
+    errors: sniff.errors,
+  });
 }
 
 function maskMapKey(key) {
@@ -285,9 +390,9 @@ export function clusterSummariesToDraftIncidents(clusters) {
       lastUpdateAt: Number.isFinite(updatedMs) ? updatedMs : Date.now(),
       source:
         FIRMS_AREA_META.mode === "world"
-          ? "NASA FIRMS VIIRS (world · FIRMS/USFS CSV)"
-          : "NASA FIRMS VIIRS (US/CAN bbox · FIRMS CSV)",
-      sources: ["NASA FIRMS VIIRS"],
+          ? "NASA FIRMS VIIRS NOAA-20+21 merged (world · FIRMS/USFS CSV)"
+          : "NASA FIRMS VIIRS NOAA-20+21 merged (US/CAN bbox · FIRMS CSV)",
+      sources: ["NASA FIRMS VIIRS NOAA-20+NRT", "NASA FIRMS VIIRS NOAA-21+NRT"],
       evacOrderActive: band === "critical",
       geocodeDone: false,
       windFetched: false,
@@ -381,11 +486,18 @@ export async function fetchFirmsClusterSummaries(signal) {
   const csvBase = resolveFirmsCsvBase();
   const dayRange = resolveFirmsDayRange();
   const dateSuffix = resolveFirmsDateUrlSuffixUTC();
-  const url =
-    `${csvBase}/${encodeURIComponent(key)}/VIIRS_SNPP_NRT/${bbox}/${dayRange}${dateSuffix}`;
+  const urlPrimary = buildFirmsAreaCsvUrl(csvBase, key, FIRMS_VIIRS_PRIMARY, bbox, dayRange, dateSuffix);
+  const urlSecondary = buildFirmsAreaCsvUrl(
+    csvBase,
+    key,
+    FIRMS_VIIRS_SECONDARY,
+    bbox,
+    dayRange,
+    dateSuffix,
+  );
 
-  const tFetch0 = performance.now();
-  console.log(`${LOG_PREFIX} Fetching VIIRS_SNPP_NRT (${FIRMS_AREA_META.mode}; dayRange ${dayRange})…`, {
+  const fetchOpts = signal ? { signal } : undefined;
+  console.log(`${LOG_PREFIX} Fetching VIIRS NOAA-20+NRT + NOAA-21+NRT (${FIRMS_AREA_META.mode}; dayRange ${dayRange})…`, {
     mapKey: maskMapKey(key),
     csvBase,
     gateway:
@@ -402,32 +514,82 @@ export async function fetchFirmsClusterSummaries(signal) {
     areaPathSegment: bbox,
     dayRange,
     datePathSegmentUTC: dateSuffix ? dateSuffix.slice(1) : "(omitted — most recent window)",
-    endpointExample:
-      `${csvBase}/<key>/VIIRS_SNPP_NRT/${bbox}/${dayRange}${dateSuffix || ""}`,
+    mergeRule: "4-decimal rounded lat/lng: keep newer acq_date/acq_time; equal time → NOAA-20",
+    urls: [redactKeyInUrl(urlPrimary, key), redactKeyInUrl(urlSecondary, key)],
+    endpointExamples: [
+      `${csvBase}/<key>/${FIRMS_VIIRS_PRIMARY}/${bbox}/${dayRange}${dateSuffix || ""}`,
+      `${csvBase}/<key>/${FIRMS_VIIRS_SECONDARY}/${bbox}/${dayRange}${dateSuffix || ""}`,
+    ],
   });
 
-  const res = await fetch(url, signal ? { signal } : undefined);
+  const tFetch0 = performance.now();
+  const settled = await Promise.allSettled([
+    fetch(urlPrimary, fetchOpts).then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      return { label: FIRMS_VIIRS_PRIMARY, text, res };
+    }),
+    fetch(urlSecondary, fetchOpts).then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      return { label: FIRMS_VIIRS_SECONDARY, text, res };
+    }),
+  ]);
   const fetchMs = Math.round(performance.now() - tFetch0);
-  if (!res.ok) {
-    console.warn(`${LOG_PREFIX} HTTP error`, res.status, res.statusText, `(${fetchMs}ms)`);
-    throw new Error(`FIRMS HTTP ${res.status}`);
+
+  let pkg20 = null;
+  let pkg21 = null;
+  const fetchErrors = [];
+  if (settled[0].status === "fulfilled") pkg20 = settled[0].value;
+  else
+    fetchErrors.push(
+      `${FIRMS_VIIRS_PRIMARY}: ${settled[0].reason?.message ?? String(settled[0].reason)}`,
+    );
+  if (settled[1].status === "fulfilled") pkg21 = settled[1].value;
+  else
+    fetchErrors.push(
+      `${FIRMS_VIIRS_SECONDARY}: ${settled[1].reason?.message ?? String(settled[1].reason)}`,
+    );
+
+  if (!pkg20 && !pkg21) {
+    console.warn(`${LOG_PREFIX} Both satellite CSV fetches failed (${fetchMs}ms)`, fetchErrors);
+    throw new Error(`FIRMS dual fetch failed: ${fetchErrors.join("; ")}`);
+  }
+  if (fetchErrors.length) {
+    console.warn(`${LOG_PREFIX} Partial satellite fetch — proceeding with remaining CSV (${fetchMs}ms)`, {
+      failures: fetchErrors,
+    });
   }
 
-  const csvText = await res.text();
   console.log(`${LOG_PREFIX} ——— NETWORK TIMING ———`, {
     fetchMs,
-    csvKB: (csvText.length / 1024).toFixed(1),
-    approximateLinesIncludingEmpty: csvText.split("\n").length,
+    ...(pkg20 && {
+      csvKB_primary: (pkg20.text.length / 1024).toFixed(1),
+      linesApprox_primary: pkg20.text.split("\n").length,
+    }),
+    ...(pkg21 && {
+      csvKB_secondary: (pkg21.text.length / 1024).toFixed(1),
+      linesApprox_secondary: pkg21.text.split("\n").length,
+    }),
   });
-  logCsvPayload(csvText, res, key);
+
+  if (pkg20) logCsvPayload(pkg20.text, pkg20.res, key);
+  if (pkg21) logCsvPayloadCompact(pkg21.text, pkg21.res, key, FIRMS_VIIRS_SECONDARY);
+
+  const parseOpts = { header: true, skipEmptyLines: true };
+  const parsed20 = pkg20 ? Papa.parse(pkg20.text, parseOpts) : emptyPapaCsv();
+  const parsed21 = pkg21 ? Papa.parse(pkg21.text, parseOpts) : emptyPapaCsv();
+
+  const { csvText: mergedCsvText, stats } = mergeNoaaViirsDualParsed(parsed20, parsed21);
+  console.log(`${LOG_PREFIX} Merged + deduped dual VIIRS`, stats);
 
   try {
-    const { clusters, ms } = await workerCluster(csvText);
+    const { clusters, ms } = await workerCluster(mergedCsvText);
     logClusterOutputs(clusters, ms, "worker");
     return clusters;
   } catch (workerErr) {
     console.warn(`${LOG_PREFIX} Worker parse/cluster failed; using main thread.`, workerErr?.message || workerErr);
-    const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+    const parsed = Papa.parse(mergedCsvText, { header: true, skipEmptyLines: true });
     console.log(`${LOG_PREFIX} ——— PAPA FULL PARSE (main-thread path) ———`, {
       rowCount: parsed.data?.length ?? 0,
       meta: parsed.meta,

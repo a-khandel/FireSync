@@ -91,7 +91,7 @@ export default function PublicGlobe({ onOpenCommand }) {
         const drafts = clusterSummariesToDraftIncidents(summaries);
         console.log(`${FIRMS_LOG} Mapped to globe incidents`, {
           pins: drafts.length,
-          source: "NASA FIRMS VIIRS",
+          source: "NASA FIRMS VIIRS NOAA-20+21 merged",
         });
         setFires((prev) => {
           const merged = mergeIncidentSnapshots(prev, drafts);
