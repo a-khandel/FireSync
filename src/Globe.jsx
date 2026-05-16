@@ -2,7 +2,7 @@
 // Renders a monochrome dotted Earth with graticule + land outlines, then
 // overlays fire pins (severity-ramp glows) and a warm atmospheric halo.
 
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import * as d3 from "d3";
 import { getBurnPolygon, getProgression, severityColor } from "./data.js";
 
@@ -20,13 +20,50 @@ function pointInRing(point, ring) {
   return inside;
 }
 
-export default function Globe({ fires, selectedId, onSelect, onHover, simulation }) {
+const IDLE_RESUME_MS = 4500;
+const AUTO_ROTATE_DEG_PER_SEC = 1.8;
+
+const ZOOM_MIN = 0.7;
+const ZOOM_MAX = 2.4;
+/** Larger steps than scroll-wheel zoom; only used by +/- UI */
+const ZOOM_BTN_IN_FACTOR = 1.26;
+const ZOOM_BTN_OUT_FACTOR = 1 / ZOOM_BTN_IN_FACTOR;
+const ZOOM_BTN_ANIM_MS = 420;
+
+/** Rotate + zoom when focusing a clicked pin */
+const PIN_FOCUS_ANIM_MS = 780;
+/** Always try to reach at least this zoom unless already closer */
+const PIN_FOCUS_ZOOM = 1.5;
+/** Also scale current zoom up by this factor when picking a pin */
+const PIN_FOCUS_ZOOM_MUL = 1.2;
+
+function easeOutCubic(t) {
+  return 1 - (1 - t) ** 3;
+}
+
+function clampZoom(z) {
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+}
+
+/** Value of +/- zoom tween at time `now` */
+function zoomTweenAt(tw, now) {
+  const t = Math.min(1, (now - tw.t0) / tw.dur);
+  const z = tw.z0 + (tw.z1 - tw.z0) * easeOutCubic(t);
+  return { z, done: t >= 1 };
+}
+
+function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const stateRef = useRef({});
   const propsRef = useRef({ selectedId, simulation, fires });
   propsRef.current = { selectedId, simulation, fires };
   const [, force] = useState(0);
+
+  useImperativeHandle(ref, () => ({
+    zoomIn: () => stateRef.current.startButtonZoom?.(ZOOM_BTN_IN_FACTOR),
+    zoomOut: () => stateRef.current.startButtonZoom?.(ZOOM_BTN_OUT_FACTOR),
+  }));
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -313,18 +350,49 @@ export default function Globe({ fires, selectedId, onSelect, onHover, simulation
     }
     stateRef.current.render = render;
 
-    let raf;
-    function loop() {
+    function bumpInteract() {
       const s = stateRef.current;
-      if (!s.autoRotate && performance.now() - s.lastInteract > 3000) s.autoRotate = true;
+      s.lastInteract = performance.now();
+      s.autoRotate = false;
+    }
+
+    stateRef.current.startButtonZoom = (factor) => {
+      const s = stateRef.current;
+      if (!s.projection) return;
+      bumpInteract();
+      const now = performance.now();
+      let z0 = s.zoom;
+      if (s.zoomTween) {
+        z0 = zoomTweenAt(s.zoomTween, now).z;
+      }
+      const z1 = clampZoom(z0 * factor);
+      if (Math.abs(z1 - z0) < 1e-5) return;
+      s.zoomTween = { z0, z1, t0: now, dur: ZOOM_BTN_ANIM_MS };
+    };
+
+    let raf;
+    let lastFrame = performance.now();
+    function loop(now) {
+      const s = stateRef.current;
+      const dt = Math.min(1 / 30, Math.max(0, (now - lastFrame) / 1000));
+      lastFrame = now;
+
+      if (s.zoomTween) {
+        const { z, done } = zoomTweenAt(s.zoomTween, now);
+        s.zoom = done ? s.zoomTween.z1 : z;
+        projection.scale(s.baseRadius * s.zoom);
+        if (done) s.zoomTween = null;
+      }
+
+      if (!s.autoRotate && now - s.lastInteract > IDLE_RESUME_MS) s.autoRotate = true;
       if (s.autoRotate) {
-        s.rotation[0] = (s.rotation[0] + 0.012) % 360;
+        s.rotation[0] = (s.rotation[0] + dt * AUTO_ROTATE_DEG_PER_SEC) % 360;
         projection.rotate(s.rotation);
       }
       render();
       raf = requestAnimationFrame(loop);
     }
-    loop();
+    requestAnimationFrame(loop);
 
     function pickPin(mx, my) {
       const pins = stateRef.current.visiblePins || [];
@@ -360,10 +428,6 @@ export default function Globe({ fires, selectedId, onSelect, onHover, simulation
         const hit = pickPin(mx, my);
         canvas.style.cursor = hit ? "pointer" : "grab";
         if (onHover) onHover(hit ? hit.f.id : null, hit ? { x: e.clientX, y: e.clientY } : null);
-        if (hit) {
-          stateRef.current.autoRotate = false;
-          stateRef.current.lastInteract = performance.now();
-        }
       }
     }
     function onPointerUp(e) {
@@ -385,11 +449,15 @@ export default function Globe({ fires, selectedId, onSelect, onHover, simulation
     function onWheel(e) {
       e.preventDefault();
       const s = stateRef.current;
+      const now = performance.now();
+      if (s.zoomTween) {
+        s.zoom = zoomTweenAt(s.zoomTween, now).z;
+        s.zoomTween = null;
+      }
       const dir = e.deltaY > 0 ? 0.92 : 1.08;
-      s.zoom = Math.max(0.7, Math.min(2.4, s.zoom * dir));
+      s.zoom = clampZoom(s.zoom * dir);
       projection.scale(s.baseRadius * s.zoom);
-      s.lastInteract = performance.now();
-      s.autoRotate = false;
+      bumpInteract();
     }
 
     canvas.addEventListener("pointerdown", onPointerDown);
@@ -414,28 +482,60 @@ export default function Globe({ fires, selectedId, onSelect, onHover, simulation
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Recenter on selected fire
+  // Recenter + zoom smoothly on selected incident (clicked pin / focus from elsewhere)
   useEffect(() => {
     const s = stateRef.current;
-    if (!s.projection || !selectedId) return;
+    if (!selectedId) {
+      s.selectionSeq = (s.selectionSeq ?? 0) + 1;
+      return;
+    }
+    if (!s.projection) return;
     const fire = fires.find((f) => f.id === selectedId);
     if (!fire) return;
+
+    s.selectionSeq = (s.selectionSeq ?? 0) + 1;
+    const seq = s.selectionSeq;
+
+    if (s.zoomTween) {
+      const nowZ = zoomTweenAt(s.zoomTween, performance.now()).z;
+      s.zoomTween = null;
+      s.zoom = nowZ;
+    }
+    if (s.baseRadius != null && s.projection) {
+      s.projection.scale(s.baseRadius * s.zoom);
+    }
+
     s.autoRotate = false;
     s.lastInteract = performance.now() + 5000;
+
+    const now0 = performance.now();
+    const zStart = s.zoom;
+    const zTarget = clampZoom(Math.max(zStart * PIN_FOCUS_ZOOM_MUL, PIN_FOCUS_ZOOM));
+
     const target = [-fire.lng, -fire.lat];
     const start = [...s.rotation];
-    const t0 = performance.now();
-    const dur = 700;
+    const t0 = now0;
+    const dur = PIN_FOCUS_ANIM_MS;
+
     function step(now) {
+      if (seq !== stateRef.current.selectionSeq) return;
+      const s2 = stateRef.current;
+      if (!s2.projection) return;
       const k = Math.min(1, (now - t0) / dur);
-      const ease = 1 - Math.pow(1 - k, 3);
+      const ease = easeOutCubic(k);
       let dλ = target[0] - start[0];
       while (dλ > 180) dλ -= 360;
       while (dλ < -180) dλ += 360;
-      s.rotation[0] = start[0] + dλ * ease;
-      s.rotation[1] = start[1] + (target[1] - start[1]) * ease;
-      s.projection.rotate(s.rotation);
+      s2.rotation[0] = start[0] + dλ * ease;
+      s2.rotation[1] = start[1] + (target[1] - start[1]) * ease;
+      s2.zoom = zStart + (zTarget - zStart) * ease;
+      s2.projection.rotate(s2.rotation);
+      s2.projection.scale(s2.baseRadius * s2.zoom);
       if (k < 1) requestAnimationFrame(step);
+      else {
+        s2.zoom = zTarget;
+        s2.projection.scale(s2.baseRadius * s2.zoom);
+      }
     }
     requestAnimationFrame(step);
   }, [selectedId, fires]);
@@ -446,3 +546,5 @@ export default function Globe({ fires, selectedId, onSelect, onHover, simulation
     </div>
   );
 }
+
+export default forwardRef(Globe);

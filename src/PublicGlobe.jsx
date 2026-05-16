@@ -1,6 +1,6 @@
 // Public Globe surface — full-bleed Earth + corner UI + drawer + simulation
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Globe from "./Globe.jsx";
 import IncidentDrawer from "./IncidentDrawer.jsx";
 import FireSimInset from "./FireSimInset.jsx";
@@ -15,6 +15,7 @@ export default function PublicGlobe({ onOpenCommand }) {
   const [lastRun] = useState(Date.now() - 167_000);
   const [hintVisible, setHintVisible] = useState(true);
   const [sim, setSim] = useState({ fireId: null, day: 1, dayCount: 7, playing: false });
+  const globeRef = useRef(null);
   const [layers, setLayers] = useState({
     perimeter: { label: "Fire Perimeter", on: true },
     wind: { label: "Wind Vectors", on: false },
@@ -76,6 +77,7 @@ export default function PublicGlobe({ onOpenCommand }) {
   return (
     <div style={{ position: "absolute", inset: 0, background: "var(--bg)", overflow: "hidden" }}>
       <Globe
+        ref={globeRef}
         fires={FIRES}
         selectedId={selectedId}
         onSelect={(id) => { setSelectedId(id); setHintVisible(false); }}
@@ -87,10 +89,69 @@ export default function PublicGlobe({ onOpenCommand }) {
 
       <div style={{
         position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)",
+        display: "flex", alignItems: "center", gap: 14, zIndex: 15,
         fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-disabled)",
-        letterSpacing: "0.16em", pointerEvents: "none",
+        letterSpacing: "0.16em",
       }}>
-        N 39.96° · W 121.78° · ALT 2.50AU
+        <span style={{ pointerEvents: "none", whiteSpace: "nowrap" }}>
+          N 39.96° · W 121.78° · ALT 2.50AU
+        </span>
+        <div
+          role="group"
+          aria-label="Globe zoom"
+          style={{
+            display: "inline-flex",
+            border: "1px solid var(--hairline-strong)",
+            background: "var(--surface-1)",
+            opacity: 0.92,
+          }}
+        >
+          <button
+            type="button"
+            aria-label="Zoom out"
+            onClick={() => globeRef.current?.zoomOut()}
+            style={{
+              width: 26, height: 26,
+              padding: 0,
+              margin: 0,
+              border: "none",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 13,
+              lineHeight: 1,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            −
+          </button>
+          <div style={{ width: 1, alignSelf: "stretch", background: "var(--hairline-strong)" }} />
+          <button
+            type="button"
+            aria-label="Zoom in"
+            onClick={() => globeRef.current?.zoomIn()}
+            style={{
+              width: 26, height: 26,
+              padding: 0,
+              margin: 0,
+              border: "none",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 13,
+              lineHeight: 1,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            +
+          </button>
+        </div>
       </div>
 
       <div className="fade-in" style={{ position: "absolute", top: 32, left: 32, zIndex: 20, pointerEvents: "none" }}>
@@ -162,7 +223,7 @@ export default function PublicGlobe({ onOpenCommand }) {
           transition: "opacity 600ms var(--ease)",
           opacity: hintVisible ? 1 : 0,
         }}>
-          <Caption>Drag to rotate · Scroll to zoom · Click a pin</Caption>
+          <Caption>Drag to rotate · Scroll or +/− to zoom · Click a pin</Caption>
         </div>
       )}
 
