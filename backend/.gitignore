@@ -1,0 +1,16 @@
+# Environments
+.env
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Mac system files
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+
+# SQLite databases (if you ever test locally)
+*.sqlite3

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>FireSync WS Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1e1e1e;
+            color: #00ff00;
+            padding: 20px;
+        }
+
+        li {
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>FireSync Agent Live Feed</h2>
+    <p>Waiting for Nemotron actions...</p>
+    <ul id="log"></ul>
+
+    <script>
+        // Connect to your local FastAPI WebSocket
+        const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+
+        ws.onmessage = function (event) {
+            const log = document.getElementById('log');
+            const newItem = document.createElement('li');
+
+            // Parse the JSON string to make it readable
+            const data = JSON.parse(event.data);
+            newItem.textContent = `[${data.timestamp}] ${data.agent}: ${data.update.action} -> ${data.update.result}`;
+
+            // Add the new message to the top of the list
+            log.insertBefore(newItem, log.firstChild);
+        };
+
+        ws.onopen = function () {
+            console.log("Connected to FireSync Backend!");
+        };
+    </script>
+</body>
+
+</html>
