@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     REDIS_URL: str = ""
     UPSTASH_REDIS_REST_URL: str
     UPSTASH_REDIS_REST_TOKEN: str
+    NASA_FIRMS_MAP_KEY: str
 
     class Config:
         env_file = ".env"
