@@ -4,7 +4,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import * as d3 from "d3";
-import { getBurnPolygon, getProgression, severityColor } from "./data.js";
+import { getBurnPolygon, getProgression, pinSeverityRank, severityColor } from "./data.js";
 
 const LAND_URL =
   "https://raw.githubusercontent.com/martynafford/natural-earth-geojson/master/110m/physical/ne_110m_land.json";
@@ -95,7 +95,8 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
 
     stateRef.current.projection = projection;
     stateRef.current.zoom = 1.0;
-    stateRef.current.rotation = [121, -38];
+    // Center orthographic roughly on continental US / southern Canada (VIIRS bbox is NA-only).
+    stateRef.current.rotation = [94, -46];
     stateRef.current.autoRotate = true;
     stateRef.current.lastInteract = 0;
     stateRef.current.land = null;
@@ -288,7 +289,7 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
       s.visiblePins = visiblePins;
 
       for (const { f, x, y } of visiblePins) {
-        const sev = f.severity || 2;
+        const sev = pinSeverityRank(f);
         const col = severityColor(sev);
         const haloR = 6 + sev * 2.2;
         const g = ctx.createRadialGradient(x, y, 0, x, y, haloR);
@@ -315,7 +316,7 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
       }
 
       for (const { f, x, y } of visiblePins) {
-        const sev = f.severity || 2;
+        const sev = pinSeverityRank(f);
         const col = severityColor(sev);
         const pr = 2.2 + sev * 0.5;
         ctx.beginPath();

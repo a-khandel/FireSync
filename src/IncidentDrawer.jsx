@@ -42,13 +42,19 @@ export default function IncidentDrawer({ fire, onClose }) {
       <Hairline />
 
       <div style={{ padding: "16px 24px" }}>
-        <MetricRow label="Size" value={fire.acres?.toLocaleString()} unit="acres" />
         <MetricRow
-          label="Containment"
-          value={fire.containmentPct}
-          unit="%"
-          valueColor={fire.containmentPct < 30 ? "var(--critical)" : fire.containmentPct < 60 ? "var(--warning)" : "var(--safe)"}
+          label="Size"
+          value={fire.acres != null ? fire.acres.toLocaleString("en-US") : "Est. large"}
+          unit={fire.acres != null ? "acres" : ""}
         />
+        {fire.containmentPct != null && (
+          <MetricRow
+            label="Containment"
+            value={fire.containmentPct}
+            unit="%"
+            valueColor={fire.containmentPct < 30 ? "var(--critical)" : fire.containmentPct < 60 ? "var(--warning)" : "var(--safe)"}
+          />
+        )}
         {fire.perimeterMi != null && <MetricRow label="Perimeter" value={fire.perimeterMi} unit="mi" />}
         {fire.growth24hAcres != null && (
           <MetricRow
@@ -57,6 +63,15 @@ export default function IncidentDrawer({ fire, onClose }) {
             unit="acres"
           />
         )}
+        {fire.point_count != null && fire.max_frp != null && (
+          <>
+            <MetricRow label="VIIRS cluster detects" value={fire.point_count} />
+            <MetricRow label="Max FRP (proxy intensity)" value={fire.max_frp.toFixed(1)} unit="MW" />
+          </>
+        )}
+        {typeof fire.severity === "string" && (
+          <MetricRow label="Threat band" value={fire.severity.replace(/^./, (c) => c.toUpperCase())} />
+        )}
         {fire.windMph != null && (
           <MetricRow
             label="Wind"
@@ -64,10 +79,10 @@ export default function IncidentDrawer({ fire, onClose }) {
           />
         )}
         {fire.humidityPct != null && <MetricRow label="Humidity" value={fire.humidityPct} unit="%" />}
-        {fire.detectedAt && (
+        {(fire.detectedAt || fire.updated_at) && (
           <MetricRow
             label="Detected"
-            value={new Date(fire.detectedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+            value={new Date(fire.detectedAt || fire.updated_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
           />
         )}
       </div>
@@ -106,7 +121,9 @@ export default function IncidentDrawer({ fire, onClose }) {
       <div style={{ padding: "16px 24px" }}>
         <div style={{ display: "flex", justifyContent: "space-between" }}>
           <Caption>Sources</Caption>
-          <Mono size={11} color="var(--text-secondary)">{(fire.sources || ["FIRMS", "NWS"]).join(" · ")}</Mono>
+          <Mono size={11} color="var(--text-secondary)">
+            {(fire.sources || (fire.source ? [fire.source] : ["FIRMS", "NWS"])).join(" · ")}
+          </Mono>
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
           <Caption>Last Update</Caption>

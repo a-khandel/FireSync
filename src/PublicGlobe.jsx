@@ -1,13 +1,28 @@
 // Public Globe surface — full-bleed Earth + corner UI + drawer + simulation
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Globe from "./Globe.jsx";
 import IncidentDrawer from "./IncidentDrawer.jsx";
 import FireSimInset from "./FireSimInset.jsx";
-import { FIRES } from "./data.js";
-import { AgentStatusPill, Caption, LayerToggles, Mono, StatsTicker, StatusDot } from "./ui.jsx";
+import { MOCK_FIRES } from "./data.js";
+import {
+  clusterSummariesToDraftIncidents,
+  enrichDemoMocks,
+  fetchFirmsClusterSummaries,
+  fetchWeatherSnapshot,
+  mergeIncidentSnapshots,
+  queueReverseGeocodes,
+} from "./firmsLive.js";
+import { AgentStatusPill, Caption, LayerToggles, Mono, NumberCounter, StatsTicker, StatusDot } from "./ui.jsx";
+
+const FIRMS_REFRESH_MS = 5 * 60 * 1000;
+const FIRMS_LOG = "[FireSync FIRMS]";
 
 export default function PublicGlobe({ onOpenCommand }) {
+  const [fires, setFires] = useState([]);
+  const [firesLoading, setFiresLoading] = useState(true);
+  const [firesDemoFallback, setFiresDemoFallback] = useState(false);
+
   const [selectedId, setSelectedId] = useState(null);
   const [hoveredId, setHoveredId] = useState(null);
   const [tooltipPos, setTooltipPos] = useState(null);
@@ -16,6 +31,9 @@ export default function PublicGlobe({ onOpenCommand }) {
   const [hintVisible, setHintVisible] = useState(true);
   const [sim, setSim] = useState({ fireId: null, day: 1, dayCount: 7, playing: false });
   const globeRef = useRef(null);
+  const firesRef = useRef([]);
+  firesRef.current = fires;
+
   const [layers, setLayers] = useState({
     perimeter: { label: "Fire Perimeter", on: true },
     wind: { label: "Wind Vectors", on: false },
@@ -24,7 +42,6 @@ export default function PublicGlobe({ onOpenCommand }) {
     shelters: { label: "Shelters", on: false },
   });
   const [stats, setStats] = useState({
-    incidents: 247,
     warningPpl: 1_284_901,
     evacOrders24h: 38,
     jurisdictions: 156,
@@ -38,7 +55,6 @@ export default function PublicGlobe({ onOpenCommand }) {
   useEffect(() => {
     const id = setInterval(() => {
       setStats((s) => ({
-        incidents: s.incidents + (Math.random() < 0.4 ? (Math.random() < 0.5 ? 1 : -1) : 0),
         warningPpl: s.warningPpl + Math.floor((Math.random() - 0.4) * 400),
         evacOrders24h: s.evacOrders24h + (Math.random() < 0.15 ? 1 : 0),
         jurisdictions: s.jurisdictions + (Math.random() < 0.08 ? 1 : 0),
@@ -51,6 +67,64 @@ export default function PublicGlobe({ onOpenCommand }) {
     const id = setInterval(() => setCycle((c) => c + 1), 60_000);
     return () => clearInterval(id);
   }, []);
+
+  const patchFire = useCallback((id, patch) => {
+    setFires((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let abortCtl = null;
+    let refreshGeneration = 0;
+
+    const refresh = async () => {
+      abortCtl?.abort();
+      abortCtl = new AbortController();
+      const signal = abortCtl.signal;
+      const gen = ++refreshGeneration;
+
+      try {
+        console.log(`${FIRMS_LOG} Refresh tick — requesting live clusters…`);
+        const summaries = await fetchFirmsClusterSummaries(signal);
+        if (cancelled || gen !== refreshGeneration) return;
+
+        const drafts = clusterSummariesToDraftIncidents(summaries);
+        console.log(`${FIRMS_LOG} Mapped to globe incidents`, {
+          pins: drafts.length,
+          source: "NASA FIRMS VIIRS",
+        });
+        setFires((prev) => {
+          const merged = mergeIncidentSnapshots(prev, drafts);
+          queueMicrotask(() =>
+            queueReverseGeocodes(merged, (fireId, geoPatch) => patchFire(fireId, geoPatch)),
+          );
+          return merged;
+        });
+        setFiresDemoFallback(false);
+      } catch (err) {
+        if (cancelled || err?.name === "AbortError" || gen !== refreshGeneration) return;
+        console.warn(`${FIRMS_LOG} Live fetch failed — using MOCK_FIRES (demo).`, {
+          reason: err?.message || String(err),
+        });
+        setFires(enrichDemoMocks(MOCK_FIRES));
+        setFiresDemoFallback(true);
+      } finally {
+        if (!cancelled && gen === refreshGeneration) setFiresLoading(false);
+      }
+    };
+
+    refresh();
+    const interval = setInterval(refresh, FIRMS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      abortCtl?.abort();
+      clearInterval(interval);
+    };
+  }, [patchFire]);
+
+  useEffect(() => {
+    if (selectedId && !fires.some((f) => f.id === selectedId)) setSelectedId(null);
+  }, [fires, selectedId]);
 
   // Simulation auto-play
   useEffect(() => {
@@ -71,14 +145,37 @@ export default function PublicGlobe({ onOpenCommand }) {
     return () => clearInterval(id);
   }, [sim.playing]);
 
-  const selected = FIRES.find((f) => f.id === selectedId);
-  const hovered = FIRES.find((f) => f.id === hoveredId);
+  useEffect(() => {
+    if (!selectedId) return;
+    let cancelled = false;
+    (async () => {
+      const fire = firesRef.current.find((x) => x.id === selectedId);
+      if (!fire || fire.windFetched || fire._demoMock) return;
+      try {
+        const { windMph, humidityPct } = await fetchWeatherSnapshot(fire.lat, fire.lng);
+        if (cancelled) return;
+        patchFire(fire.id, {
+          windMph,
+          humidityPct,
+          wind_mph: windMph,
+          humidity_pct: humidityPct,
+          windFetched: true,
+        });
+      } catch {
+        patchFire(fire.id, { windFetched: true });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedId, patchFire]);
+
+  const selected = fires.find((f) => f.id === selectedId);
+  const hovered = fires.find((f) => f.id === hoveredId);
 
   return (
     <div style={{ position: "absolute", inset: 0, background: "var(--bg)", overflow: "hidden" }}>
       <Globe
         ref={globeRef}
-        fires={FIRES}
+        fires={fires}
         selectedId={selectedId}
         onSelect={(id) => { setSelectedId(id); setHintVisible(false); }}
         onHover={(id, pos) => { setHoveredId(id); setTooltipPos(pos); }}
@@ -156,6 +253,23 @@ export default function PublicGlobe({ onOpenCommand }) {
 
       <div className="fade-in" style={{ position: "absolute", top: 32, left: 32, zIndex: 20, pointerEvents: "none" }}>
         <AgentStatusPill cycle={cycle} lastRunMs={lastRun} />
+        <Mono
+          size={11}
+          color="var(--text-tertiary)"
+          className={firesLoading ? "dot-pulse" : undefined}
+          style={{ marginTop: 14, letterSpacing: "0.12em", display: "block", whiteSpace: "nowrap" }}
+        >
+          {firesLoading ? (
+            "loading fires…"
+          ) : (
+            <>
+              <NumberCounter value={fires.length} /> active incidents worldwide
+              {firesDemoFallback && (
+                <span style={{ opacity: 0.72, marginLeft: 8 }}>· using demo data</span>
+              )}
+            </>
+          )}
+        </Mono>
       </div>
 
       <div className="fade-in" style={{ position: "absolute", top: 32, right: 32, zIndex: 20, display: "flex", flexDirection: "column", gap: 16, alignItems: "flex-end" }}>
@@ -173,7 +287,6 @@ export default function PublicGlobe({ onOpenCommand }) {
         <div className="fade-in" style={{ position: "absolute", bottom: 32, left: 32, zIndex: 20 }}>
           <StatsTicker
             stats={[
-              { label: "Active Incidents", value: stats.incidents },
               { label: "People in Warning Zones", value: stats.warningPpl },
               { label: "Evac Orders Drafted (24h)", value: stats.evacOrders24h },
               { label: "Jurisdictions Notified", value: stats.jurisdictions },
@@ -238,9 +351,18 @@ export default function PublicGlobe({ onOpenCommand }) {
             <span className="body-sm" style={{ color: "var(--text-primary)", fontWeight: 600 }}>{hovered.name}</span>
           </div>
           <Mono size={11} color="var(--text-tertiary)" style={{ display: "block", marginBottom: 6 }}>{hovered.jurisdiction}</Mono>
+          {typeof hovered.point_count === "number" && (
+            <Mono size={10} color="var(--text-disabled)" style={{ display: "block", marginBottom: 6 }}>
+              {hovered.point_count} VIIRS detects · max FRP {hovered.max_frp != null ? hovered.max_frp.toFixed(1) : "—"} MW
+            </Mono>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
-            <Mono size={11} color="var(--text-secondary)">{hovered.acres?.toLocaleString() || "—"} ac</Mono>
-            <Mono size={11} color="var(--text-secondary)">{hovered.containmentPct ?? "—"}% cont</Mono>
+            <Mono size={11} color="var(--text-secondary)">
+              {hovered.acres != null ? `${hovered.acres.toLocaleString()} ac` : "Est. large"}
+            </Mono>
+            <Mono size={11} color="var(--text-secondary)">
+              {hovered.containmentPct != null ? `${hovered.containmentPct}% cont` : "—"}
+            </Mono>
           </div>
         </div>
       )}

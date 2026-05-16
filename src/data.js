@@ -1,6 +1,6 @@
 // FireSync mock data — ES module exports
 
-export const FIRES = [
+export const MOCK_FIRES = [
   {
     id: "park-fire", name: "Park Fire", jurisdiction: "Tehama Co, California", countryCode: "US",
     lat: 39.96, lng: -121.78, acres: 429600, containmentPct: 34, perimeterMi: 247,
@@ -78,6 +78,9 @@ export const FIRES = [
   { id: "newzealand-1", name: "Canterbury", jurisdiction: "Canterbury, NZ", lat: -43.53, lng: 172.07, acres: 2800, containmentPct: 29, severity: 2 },
 ];
 
+/** Legacy alias — Command Center still uses mock incidents */
+export const FIRES = MOCK_FIRES;
+
 function makeHotspots(centerLat, centerLng, count) {
   const out = [];
   for (let i = 0; i < count; i++) {
@@ -93,7 +96,7 @@ function makeHotspots(centerLat, centerLng, count) {
   return out;
 }
 // pre-generate hotspots for park fire (used by command map)
-FIRES[0].hotspots = makeHotspots(FIRES[0].lat, FIRES[0].lng, 60);
+MOCK_FIRES[0].hotspots = makeHotspots(MOCK_FIRES[0].lat, MOCK_FIRES[0].lng, 60);
 
 export const AGENT_LOG = [
   { t: "14:47:02", type: "DRAFT_EVAC_ORDER",     target: "Zone 1B added (1,890 ppl)",        conf: 0.84, severity: "critical" },
@@ -144,6 +147,14 @@ export const BRIEF =
 export function severityColor(s) {
   return ["#FFD66B", "#FFA744", "#FF6F2C", "#FF3D14", "#C82400"][Math.max(0, Math.min(4, s - 1))];
 }
+
+/** Globe pins — mock fires use numeric severity 1–5; FIRMS uses string bands */
+export function pinSeverityRank(f) {
+  if (typeof f.severity === "number") return Math.max(1, Math.min(5, f.severity));
+  const band = { critical: 5, high: 4, moderate: 3 };
+  return band[f.severity] ?? 3;
+}
+
 export function fmtNum(n) {
   if (n == null) return "—";
   return n.toLocaleString("en-US");
