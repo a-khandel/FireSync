@@ -6,3 +6,6 @@ redis
 pydantic
 pydantic-settings
 requests
+openai
+python-dotenv
+httpx
