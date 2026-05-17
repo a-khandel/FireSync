@@ -167,9 +167,6 @@ export function AgentStatusPill({ cycle, lastRunMs }) {
           AGENT ACTIVE · CYCLE&nbsp;<Mono size={11} weight={500} color="var(--text-primary)">{cycle.toLocaleString("en-US")}</Mono>
         </span>
       </div>
-      <div className="mono-sm" style={{ color: "var(--text-tertiary)", marginTop: 4, paddingLeft: 16, letterSpacing: "0.05em", whiteSpace: "nowrap" }}>
-        LAST RUN <TimeAgo from={lastRunMs} /> AGO
-      </div>
     </div>
   );
 }

@@ -1,18 +1,17 @@
 import Papa from "papaparse";
-import { normalizeRow, parseAcqMs, runPipeline } from "./firmsClusterEngine.js";
+import { runPipeline } from "./firmsClusterEngine.js";
 
 /**
  * FIRMS CSV base URL — default aligns with FIRMS US/Canada portal (USFS gateway).
  *
- * Two parallel VIIRS pulls (NOAA-20 primary, NOAA-21 secondary), row merge with
- * spatial dedupe keeping the newest acquisition (`acq_date`/`acq_time`; NOAA-20 breaks ties).
+ * Single VIIRS NOAA-21+NRT area CSV (`VIIRS_NOAA21_NRT`; DATE segment optional via env).
  * Path shape:
- *   /usfs/api/area/csv/[MAP_KEY]/VIIRS_NOAA20_NRT|VIIRS_NOAA21_NRT/[AREA]/[DAY_RANGE]/[DATE?]
+ *   /usfs/api/area/csv/[MAP_KEY]/VIIRS_NOAA21_NRT/[AREA]/[DAY_RANGE]/[DATE?]
  *
  * Override base e.g. global gateway:
  *   VITE_FIRMS_AREA_CSV_BASE=https://firms.modaps.eosdis.nasa.gov/api/area/csv
  */
-const FIRMS_CSV_BASE_DEFAULT = "https://firms.modaps.eosdis.nasa.gov/usfs/api/area/csv";
+const FIRMS_CSV_BASE_DEFAULT = "https://firms.modaps.eosdis.nasa.gov/api/area/csv";
 const PHOTON_REVERSE_BASE = "https://photon.komoot.io/reverse";
 /** OSM: identify app — https://operations.osmfoundation.org/policies/nominatim/ */
 const NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse";
@@ -25,9 +24,10 @@ const GEO_INTER_MS_NOMINATIM = 1100;
 let reverseGeocodeProviderProbePromise = null;
 
 const LOG_PREFIX = "[FireSync FIRMS]";
-
-const FIRMS_VIIRS_PRIMARY = "VIIRS_NOAA20_NRT";
-const FIRMS_VIIRS_SECONDARY = "VIIRS_NOAA21_NRT";
+const FIRMS_VIIRS_SOURCE = "VIIRS_SNPP_NRT";
+const CAL_FIRE_LOG = "[FireSync CAL FIRE]";
+/** Incident must have Started or Updated within this window vs fetch time (API returns full history). */
+const CAL_FIRE_VISIBLE_START_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Bounding box west,south,east,north: US (+AK/HI) + Canada. FIRMS also accepts literal `world`.
@@ -105,7 +105,7 @@ function resolveFirmsDayRange() {
 function resolveFirmsDateUrlSuffixUTC() {
   const omit = ["0", "false", "no", "off"].includes(
     String(import.meta.env.VITE_FIRMS_APPEND_DATE ?? "").trim().toLowerCase(),
-  );
+  ) || !import.meta.env.VITE_FIRMS_APPEND_DATE;
   if (omit) return "";
   const fixed = String(import.meta.env.VITE_FIRMS_DATE ?? "").trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(fixed)) return `/${fixed}`;
@@ -114,107 +114,6 @@ function resolveFirmsDateUrlSuffixUTC() {
   const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
   const da = String(d.getUTCDate()).padStart(2, "0");
   return `/${y}-${mo}-${da}`;
-}
-
-function buildFirmsAreaCsvUrl(csvBase, mapKey, viirsSource, bbox, dayRange, dateSuffix) {
-  return `${csvBase}/${encodeURIComponent(mapKey)}/${viirsSource}/${bbox}/${dayRange}${dateSuffix}`;
-}
-
-function spatialDedupeKey(norm) {
-  const lat = parseFloat(norm.latitude);
-  const lng = parseFloat(norm.longitude);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  const rl = Math.round(lat * 10000) / 10000;
-  const rn = Math.round(lng * 10000) / 10000;
-  return `${rl},${rn}`;
-}
-
-function emptyPapaCsv() {
-  return { data: [], meta: { fields: [] }, errors: [] };
-}
-
-/**
- * NOAA-20 = tier 0 (primary), NOAA-21 = tier 1. Same rounded lat/lng (4 decimals):
- * keep newest acquisition; on equal timestamp prefer NOAA-20.
- */
-function mergeNoaaViirsDualParsed(parsedPrimary, parsedSecondary) {
-  const fields = [
-    ...new Set([...(parsedPrimary.meta.fields || []), ...(parsedSecondary.meta.fields || [])]),
-  ];
-  const rowsP = parsedPrimary.data || [];
-  const rowsS = parsedSecondary.data || [];
-  const totalIn = rowsP.length + rowsS.length;
-
-  const items = [];
-  for (const r of rowsP) items.push({ raw: r, tier: 0 });
-  for (const r of rowsS) items.push({ raw: r, tier: 1 });
-
-  for (const it of items) {
-    const norm = normalizeRow(it.raw);
-    const ms = parseAcqMs(norm.acq_date, norm.acq_time);
-    it.ms = ms;
-    it.key = spatialDedupeKey(norm);
-  }
-
-  items.sort((a, b) => {
-    if (b.ms !== a.ms) return b.ms - a.ms;
-    return a.tier - b.tier;
-  });
-
-  const out = [];
-  const seen = new Set();
-  let droppedDup = 0;
-  let droppedNoKey = 0;
-  for (const it of items) {
-    if (!it.key) {
-      droppedNoKey++;
-      continue;
-    }
-    if (seen.has(it.key)) {
-      droppedDup++;
-      continue;
-    }
-    seen.add(it.key);
-    out.push(it.raw);
-  }
-
-  const csvText = Papa.unparse(out, { columns: fields });
-  return {
-    csvText,
-    stats: {
-      totalIn,
-      kept: out.length,
-      droppedDuplicate: droppedDup,
-      droppedNoCoordinates: droppedNoKey,
-      fromPrimary: rowsP.length,
-      fromSecondary: rowsS.length,
-    },
-  };
-}
-
-/** Lighter logs for the secondary satellite CSV (avoid duplicating raw 2.5k dumps). */
-function logCsvPayloadCompact(csvText, res, mapKey, label) {
-  const headersObj = {};
-  res.headers.forEach((v, k) => {
-    headersObj[k] = v;
-  });
-  console.log(`${LOG_PREFIX} ——— FETCH RESPONSE META (${label}) ———`, {
-    ok: res.ok,
-    status: res.status,
-    statusText: res.statusText,
-    url: redactKeyInUrl(res.url || "", mapKey),
-    headers: headersObj,
-  });
-  const shape = inspectCsvText(csvText);
-  console.log(`${LOG_PREFIX} ——— CSV STRUCTURE (${label}) ———`, shape);
-  const sniff = Papa.parse(csvText, { header: true, preview: 8, skipEmptyLines: true });
-  console.log(`${LOG_PREFIX} ——— PAPA PARSE SNIFF (${label}) ———`, {
-    delimiter: sniff.meta?.delimiter,
-    linebreak: sniff.meta?.linebreak,
-    fields: sniff.meta?.fields,
-    previewRowObjects: sniff.data,
-    errors: sniff.errors,
-  });
 }
 
 function maskMapKey(key) {
@@ -362,6 +261,196 @@ export function stableFireId(lat, lng) {
   return `${rl}_${rg}`.replace(/-/g, "m");
 }
 
+function resolveCalFireIncidentListUrl() {
+  const env = String(import.meta.env.VITE_CAL_FIRE_INCIDENT_LIST_URL ?? "").trim();
+  if (env) return env;
+  if (import.meta.env.DEV) return "/cal-fire-api/umbraco/api/IncidentApi/List?inactive=true";
+  return "https://incidents.fire.ca.gov/umbraco/api/IncidentApi/List?inactive=true";
+}
+
+/** Threat band from official acres / containment — independent of FIRMS cluster heuristics */
+export function classifyCalFireIncidentBand(acresBurned, percentContained, isActive) {
+  const aNum = acresBurned != null ? Number(acresBurned) : NaN;
+  const acresN = Number.isFinite(aNum) && aNum >= 0 ? aNum : 0;
+  const pRaw = percentContained != null && percentContained !== "" ? Number(percentContained) : null;
+  const p = Number.isFinite(pRaw) ? pRaw : isActive ? 0 : 100;
+  if (acresN >= 2500 || (isActive && p < 15)) return "critical";
+  if (acresN >= 250 || (isActive && p < 50)) return "high";
+  return "moderate";
+}
+
+function calFireIncidentTypeOk(type) {
+  const t = String(type ?? "").trim().toLowerCase();
+  if (!t) return true;
+  return t.includes("wildfire") || t === "fire" || /\bfire\b/.test(t);
+}
+
+function calFireIncidentStartedMs(row) {
+  if (typeof row.Started === "string" && row.Started.trim()) {
+    const ms = Date.parse(row.Started.trim());
+    if (Number.isFinite(ms)) return ms;
+  }
+  const d = String(row.StartedDateOnly ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+    const ms = Date.parse(`${d}T12:00:00Z`);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return NaN;
+}
+
+function calFireApiRowToDraft(row, referenceNowMs = Date.now()) {
+  const lat = Number(row.Latitude ?? row.latitude);
+  const lng = Number(row.Longitude ?? row.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  if (!calFireIncidentTypeOk(row.Type)) return null;
+
+  const uid = String(row.UniqueId ?? "").trim();
+  if (!uid) return null;
+
+  const fireStartedMs = calFireIncidentStartedMs(row);
+  let incidentUpdatedMs = NaN;
+  if (typeof row.Updated === "string" && row.Updated.trim()) {
+    incidentUpdatedMs = Date.parse(row.Updated.trim());
+  }
+
+  const startedInWindow =
+    Number.isFinite(fireStartedMs) &&
+    fireStartedMs <= referenceNowMs &&
+    referenceNowMs - fireStartedMs <= CAL_FIRE_VISIBLE_START_WINDOW_MS;
+  const updatedInWindow =
+    Number.isFinite(incidentUpdatedMs) &&
+    incidentUpdatedMs <= referenceNowMs &&
+    referenceNowMs - incidentUpdatedMs <= CAL_FIRE_VISIBLE_START_WINDOW_MS;
+
+  if (!startedInWindow && !updatedInWindow) return null;
+
+  const nameRaw = String(row.Name ?? "").trim().replace(/\s+$/, "");
+  const name = nameRaw || "California incident";
+  const county = String(row.County ?? "").trim();
+  const locationTxt = String(row.Location ?? "").trim();
+  const isActive = !!row.IsActive;
+
+  let acres =
+    row.AcresBurned != null && row.AcresBurned !== "" ? Number(row.AcresBurned) : null;
+  if (!Number.isFinite(acres)) acres = null;
+
+  let containment =
+    row.PercentContained != null && row.PercentContained !== ""
+      ? Number(row.PercentContained)
+      : null;
+  if (!Number.isFinite(containment)) containment = null;
+
+  const band = classifyCalFireIncidentBand(acres ?? 0, containment, isActive);
+
+  const updatedIso =
+    typeof row.Updated === "string" && row.Updated
+      ? row.Updated
+      : typeof row.Started === "string" && row.Started
+        ? row.Started
+        : new Date().toISOString();
+
+  let updatedMs = Date.parse(updatedIso);
+  if (!Number.isFinite(updatedMs)) updatedMs = Date.now();
+
+  const startedIso = (() => {
+    if (typeof row.Started === "string" && row.Started.trim()) return row.Started.trim();
+    const dOnly = String(row.StartedDateOnly ?? "").trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dOnly)) return `${dOnly}T12:00:00Z`;
+    if (Number.isFinite(fireStartedMs)) return new Date(fireStartedMs).toISOString();
+    if (typeof row.Updated === "string" && row.Updated.trim()) return row.Updated.trim();
+    return new Date(referenceNowMs).toISOString();
+  })();
+
+  const jurisdictionChunks = [];
+  if (locationTxt) jurisdictionChunks.push(locationTxt);
+  if (county) jurisdictionChunks.push(`${county} County`);
+  jurisdictionChunks.push("California");
+  const jurisdiction = jurisdictionChunks.join(" · ");
+
+  const region = county ? `${county}, California` : "California";
+
+  const adminUnit = row.AdminUnit != null ? String(row.AdminUnit).trim() : "";
+  const detailUrl =
+    typeof row.Url === "string" && row.Url.startsWith("http") ? row.Url : null;
+
+  return {
+    id: `caf_${uid}`,
+    name,
+    jurisdiction,
+    region,
+    lat,
+    lng,
+    lon: lng,
+    severity: band,
+    point_count: null,
+    max_frp: null,
+    acres,
+    containmentPct: containment,
+    contained:
+      containment != null
+        ? containment >= 100
+        : !!(row.Final === true || !isActive || String(row.ExtinguishedDate ?? "").trim()),
+    incidentDetailUrl: detailUrl,
+    adminUnit: adminUnit || null,
+    wind_mph: null,
+    humidity_pct: null,
+    windMph: null,
+    humidityPct: null,
+    detectedAt: startedIso,
+    updated_at: updatedIso,
+    lastUpdateAt: updatedMs,
+    source: adminUnit
+      ? `CAL FIRE · ${adminUnit.slice(0, 80)}${adminUnit.length > 80 ? "…" : ""}`
+      : "CAL FIRE (fire.ca.gov)",
+    sources: ["CAL FIRE Incident API (fire.ca.gov)"],
+    evacOrderActive: band === "critical" && isActive && (containment == null || containment < 90),
+    geocodeDone: true,
+    windFetched: false,
+    _demoMock: false,
+  };
+}
+
+/** Official California incident arcs from Fire.ca.gov Incident API (`inactive=true` = include contained). */
+export async function fetchCalFireIncidentDrafts(signal) {
+  const url = resolveCalFireIncidentListUrl();
+  const t0 = performance.now();
+  console.log(`${CAL_FIRE_LOG} Fetching statewide incidents…`, { url });
+
+  const res = await fetch(url, {
+    signal,
+    credentials: "omit",
+    headers: { Accept: "application/json" },
+  });
+  const fetchMs = Math.round(performance.now() - t0);
+  if (!res.ok) {
+    console.warn(`${CAL_FIRE_LOG} HTTP error`, res.status, res.statusText, `(${fetchMs}ms)`);
+    throw new Error(`CAL FIRE IncidentApi HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  if (!Array.isArray(data)) {
+    console.warn(`${CAL_FIRE_LOG} Expected JSON array, got ${typeof data}`);
+    return [];
+  }
+
+  const nowMs = Date.now();
+  const drafts = [];
+  for (const row of data) {
+    const d = calFireApiRowToDraft(row, nowMs);
+    if (d) drafts.push(d);
+  }
+
+  console.log(`${CAL_FIRE_LOG} Parsed incidents`, {
+    fetchMs,
+    incoming: data.length,
+    mappedPins: drafts.length,
+    withinLastHours24StartedOrUpdated: true,
+  });
+
+  return drafts;
+}
+
 export function clusterSummariesToDraftIncidents(clusters) {
   return clusters.map((c) => {
     const band = classifySeverity(c.point_count, c.max_frp);
@@ -390,15 +479,52 @@ export function clusterSummariesToDraftIncidents(clusters) {
       lastUpdateAt: Number.isFinite(updatedMs) ? updatedMs : Date.now(),
       source:
         FIRMS_AREA_META.mode === "world"
-          ? "NASA FIRMS VIIRS NOAA-20+21 merged (world · FIRMS/USFS CSV)"
-          : "NASA FIRMS VIIRS NOAA-20+21 merged (US/CAN bbox · FIRMS CSV)",
-      sources: ["NASA FIRMS VIIRS NOAA-20+NRT", "NASA FIRMS VIIRS NOAA-21+NRT"],
+          ? "NASA FIRMS VIIRS NOAA-21+NRT (world · FIRMS/USFS CSV)"
+          : "NASA FIRMS VIIRS NOAA-21+NRT (US/CAN bbox · FIRMS CSV)",
+      sources: ["NASA FIRMS VIIRS NOAA-21+NRT"],
       evacOrderActive: band === "critical",
       geocodeDone: false,
       windFetched: false,
       _demoMock: false,
     };
   });
+}
+
+/**
+ * If a VIIRS-derived pin lands near an official CAL FIRE incident (~0.05° ≈ ~5 km N/S — same visual stack),
+ * keep only the CAL FIRE row for that location.
+ */
+const FIRMS_CAL_OVERLAP_SQ_DEG = 0.05 * 0.05;
+
+export function combineFirmsAndCalDraftsPreferCalFire(firmsDrafts, cafDrafts) {
+  const cafes = [...cafDrafts];
+  const out = [...cafes];
+  let droppedOverlap = 0;
+  for (const f of firmsDrafts) {
+    const lat = f.lat;
+    const lng = f.lng;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      out.push(f);
+      continue;
+    }
+    let nearCalFire = false;
+    for (const c of cafes) {
+      const dl = lat - c.lat;
+      const dn = lng - c.lng;
+      if (dl * dl + dn * dn <= FIRMS_CAL_OVERLAP_SQ_DEG) {
+        nearCalFire = true;
+        break;
+      }
+    }
+    if (nearCalFire) droppedOverlap++;
+    else out.push(f);
+  }
+  if (droppedOverlap > 0) {
+    console.log(`${LOG_PREFIX} Overlap dedupe — dropped ${droppedOverlap} FIRMS pin(s) in favor of nearby CAL FIRE`, {
+      withinDegrees: Math.sqrt(FIRMS_CAL_OVERLAP_SQ_DEG),
+    });
+  }
+  return out;
 }
 
 function workerCluster(csvText) {
@@ -486,18 +612,11 @@ export async function fetchFirmsClusterSummaries(signal) {
   const csvBase = resolveFirmsCsvBase();
   const dayRange = resolveFirmsDayRange();
   const dateSuffix = resolveFirmsDateUrlSuffixUTC();
-  const urlPrimary = buildFirmsAreaCsvUrl(csvBase, key, FIRMS_VIIRS_PRIMARY, bbox, dayRange, dateSuffix);
-  const urlSecondary = buildFirmsAreaCsvUrl(
-    csvBase,
-    key,
-    FIRMS_VIIRS_SECONDARY,
-    bbox,
-    dayRange,
-    dateSuffix,
-  );
+  const url =
+    `${csvBase}/${encodeURIComponent(key)}/${FIRMS_VIIRS_SOURCE}/${bbox}/${dayRange}${dateSuffix}`;
 
-  const fetchOpts = signal ? { signal } : undefined;
-  console.log(`${LOG_PREFIX} Fetching VIIRS NOAA-20+NRT + NOAA-21+NRT (${FIRMS_AREA_META.mode}; dayRange ${dayRange})…`, {
+  const tFetch0 = performance.now();
+  console.log(`${LOG_PREFIX} Fetching VIIRS NOAA-21+NRT (${FIRMS_AREA_META.mode}; dayRange ${dayRange})…`, {
     mapKey: maskMapKey(key),
     csvBase,
     gateway:
@@ -514,82 +633,33 @@ export async function fetchFirmsClusterSummaries(signal) {
     areaPathSegment: bbox,
     dayRange,
     datePathSegmentUTC: dateSuffix ? dateSuffix.slice(1) : "(omitted — most recent window)",
-    mergeRule: "4-decimal rounded lat/lng: keep newer acq_date/acq_time; equal time → NOAA-20",
-    urls: [redactKeyInUrl(urlPrimary, key), redactKeyInUrl(urlSecondary, key)],
-    endpointExamples: [
-      `${csvBase}/<key>/${FIRMS_VIIRS_PRIMARY}/${bbox}/${dayRange}${dateSuffix || ""}`,
-      `${csvBase}/<key>/${FIRMS_VIIRS_SECONDARY}/${bbox}/${dayRange}${dateSuffix || ""}`,
-    ],
+    urlRedacted: redactKeyInUrl(url, key),
+    endpointExample:
+      `${csvBase}/<key>/${FIRMS_VIIRS_SOURCE}/${bbox}/${dayRange}${dateSuffix || ""}`,
   });
 
-  const tFetch0 = performance.now();
-  const settled = await Promise.allSettled([
-    fetch(urlPrimary, fetchOpts).then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      return { label: FIRMS_VIIRS_PRIMARY, text, res };
-    }),
-    fetch(urlSecondary, fetchOpts).then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      return { label: FIRMS_VIIRS_SECONDARY, text, res };
-    }),
-  ]);
+  const res = await fetch(url, signal ? { signal } : undefined);
   const fetchMs = Math.round(performance.now() - tFetch0);
-
-  let pkg20 = null;
-  let pkg21 = null;
-  const fetchErrors = [];
-  if (settled[0].status === "fulfilled") pkg20 = settled[0].value;
-  else
-    fetchErrors.push(
-      `${FIRMS_VIIRS_PRIMARY}: ${settled[0].reason?.message ?? String(settled[0].reason)}`,
-    );
-  if (settled[1].status === "fulfilled") pkg21 = settled[1].value;
-  else
-    fetchErrors.push(
-      `${FIRMS_VIIRS_SECONDARY}: ${settled[1].reason?.message ?? String(settled[1].reason)}`,
-    );
-
-  if (!pkg20 && !pkg21) {
-    console.warn(`${LOG_PREFIX} Both satellite CSV fetches failed (${fetchMs}ms)`, fetchErrors);
-    throw new Error(`FIRMS dual fetch failed: ${fetchErrors.join("; ")}`);
-  }
-  if (fetchErrors.length) {
-    console.warn(`${LOG_PREFIX} Partial satellite fetch — proceeding with remaining CSV (${fetchMs}ms)`, {
-      failures: fetchErrors,
-    });
+  if (!res.ok) {
+    console.warn(`${LOG_PREFIX} HTTP error`, res.status, res.statusText, `(${fetchMs}ms)`);
+    throw new Error(`FIRMS HTTP ${res.status}`);
   }
 
+  const csvText = await res.text();
   console.log(`${LOG_PREFIX} ——— NETWORK TIMING ———`, {
     fetchMs,
-    ...(pkg20 && {
-      csvKB_primary: (pkg20.text.length / 1024).toFixed(1),
-      linesApprox_primary: pkg20.text.split("\n").length,
-    }),
-    ...(pkg21 && {
-      csvKB_secondary: (pkg21.text.length / 1024).toFixed(1),
-      linesApprox_secondary: pkg21.text.split("\n").length,
-    }),
+    csvKB: (csvText.length / 1024).toFixed(1),
+    approximateLinesIncludingEmpty: csvText.split("\n").length,
   });
-
-  if (pkg20) logCsvPayload(pkg20.text, pkg20.res, key);
-  if (pkg21) logCsvPayloadCompact(pkg21.text, pkg21.res, key, FIRMS_VIIRS_SECONDARY);
-
-  const parseOpts = { header: true, skipEmptyLines: true };
-  const parsed20 = pkg20 ? Papa.parse(pkg20.text, parseOpts) : emptyPapaCsv();
-  const parsed21 = pkg21 ? Papa.parse(pkg21.text, parseOpts) : emptyPapaCsv();
-
-  const { csvText: mergedCsvText, stats } = mergeNoaaViirsDualParsed(parsed20, parsed21);
-  console.log(`${LOG_PREFIX} Merged + deduped dual VIIRS`, stats);
+  logCsvPayload(csvText, res, key);
 
   try {
-    const { clusters, ms } = await workerCluster(mergedCsvText);
+    const { clusters, ms } = await workerCluster(csvText);
     logClusterOutputs(clusters, ms, "worker");
     return clusters;
   } catch (workerErr) {
     console.warn(`${LOG_PREFIX} Worker parse/cluster failed; using main thread.`, workerErr?.message || workerErr);
-    const parsed = Papa.parse(mergedCsvText, { header: true, skipEmptyLines: true });
+    const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
     console.log(`${LOG_PREFIX} ——— PAPA FULL PARSE (main-thread path) ———`, {
       rowCount: parsed.data?.length ?? 0,
       meta: parsed.meta,

@@ -1,5 +1,8 @@
 // Pure FIRMS clustering — imported by Web Worker and main-thread fallback.
 
+/** Hotspots weaker than this (MW) are skipped before clustering — reduces noise pins. */
+const MIN_FRP_MW = 10;
+
 const CLUSTER_CELL = 0.5;
 const CLUSTER_THRESH_SQ = 0.5 * 0.5;
 
@@ -12,7 +15,12 @@ export function normalizeRow(raw) {
   return r;
 }
 
-/** FIRMS date parse — yyyy-mm-dd or yyyymmdd + hour-only (e.g. `13`), HHMM, or HHMMSS */
+/**
+ * FIRMS date parse — yyyy-mm-dd or yyyymmdd + acquisition time (UTC).
+ * NASA encodes `acq_time` as HHMM; CSV often drops leading zeros (`30` → 00:30)
+ * or stores it as a compact number (`1135` → 11:35). One- or two-digit values
+ * in 0…23 are still treated as hour-only (e.g. `5` → 05:00) for compatibility.
+ */
 export function parseAcqMs(acqDate, acqTime) {
   if (!acqDate) return 0;
   const ds = String(acqDate).replace(/\D/g, "");
@@ -27,26 +35,35 @@ export function parseAcqMs(acqDate, acqTime) {
   let mm = 0;
   let ss = 0;
 
-  if (digitsOnly.length <= 2 && digitsOnly.length > 0) {
-    const hour = parseInt(digitsOnly, 10);
-    if (hour >= 0 && hour <= 23) {
-      hh = hour;
-      mm = 0;
-      ss = 0;
-    }
-  } else if (digitsOnly.length === 4) {
-    hh = +digitsOnly.slice(0, 2);
-    mm = +digitsOnly.slice(2, 4);
-    ss = 0;
-  } else if (digitsOnly.length >= 6) {
+  if (!digitsOnly) {
+    return Date.UTC(y, mo, d, hh, mm, ss);
+  }
+
+  if (digitsOnly.length >= 6) {
     const tail = digitsOnly.slice(-6);
     hh = +tail.slice(0, 2);
     mm = +tail.slice(2, 4);
     ss = +tail.slice(4, 6);
-  } else if (digitsOnly.length === 3) {
-    hh = +digitsOnly.slice(0, 1);
-    mm = +digitsOnly.slice(1);
+    return Date.UTC(y, mo, d, hh, mm, ss);
+  }
+
+  const n = parseInt(digitsOnly, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    return Date.UTC(y, mo, d, hh, mm, ss);
+  }
+
+  if (digitsOnly.length <= 2 && n <= 23) {
+    hh = n;
+    mm = 0;
     ss = 0;
+    return Date.UTC(y, mo, d, hh, mm, ss);
+  }
+
+  // HHMM as integer: 30 → 00:30, 130 → 01:30, 1135 → 11:35, 1300 → 13:00
+  hh = Math.floor(n / 100);
+  mm = n % 100;
+  if (mm > 59 || hh > 23) {
+    return Date.UTC(y, mo, d, 0, 0, 0);
   }
 
   return Date.UTC(y, mo, d, hh, mm, ss);
@@ -62,6 +79,7 @@ export function rowToPoint(row) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   const frp = parseFloat(row.frp);
   const frpN = Number.isFinite(frp) ? frp : 0;
+  if (frpN <= MIN_FRP_MW) return null;
   const daynight = String(row.daynight ?? "").toUpperCase().slice(0, 1) || "?";
   const acqMs = parseAcqMs(row.acq_date, row.acq_time);
   return { lat, lng, frp: frpN, daynight, acqMs };

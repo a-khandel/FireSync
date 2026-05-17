@@ -1,24 +1,26 @@
 // Public Globe surface — full-bleed Earth + corner UI + drawer + simulation
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import Globe from "./Globe.jsx";
 import IncidentDrawer from "./IncidentDrawer.jsx";
-import FireSimInset from "./FireSimInset.jsx";
 import { MOCK_FIRES } from "./data.js";
 import {
   clusterSummariesToDraftIncidents,
+  combineFirmsAndCalDraftsPreferCalFire,
   enrichDemoMocks,
+  fetchCalFireIncidentDrafts,
   fetchFirmsClusterSummaries,
   fetchWeatherSnapshot,
   mergeIncidentSnapshots,
   queueReverseGeocodes,
 } from "./firmsLive.js";
 import { AgentStatusPill, Caption, LayerToggles, Mono, NumberCounter, StatsTicker, StatusDot } from "./ui.jsx";
+import { getAuth, clearAuth } from "./auth.js";
 
-const FIRMS_REFRESH_MS = 5 * 60 * 1000;
 const FIRMS_LOG = "[FireSync FIRMS]";
 
-export default function PublicGlobe({ onOpenCommand }) {
+export default function PublicGlobe() {
   const [fires, setFires] = useState([]);
   const [firesLoading, setFiresLoading] = useState(true);
   const [firesDemoFallback, setFiresDemoFallback] = useState(false);
@@ -28,8 +30,9 @@ export default function PublicGlobe({ onOpenCommand }) {
   const [tooltipPos, setTooltipPos] = useState(null);
   const [cycle, setCycle] = useState(4127);
   const [lastRun] = useState(Date.now() - 167_000);
+  const navigate = useNavigate();
+  const auth = getAuth();
   const [hintVisible, setHintVisible] = useState(true);
-  const [sim, setSim] = useState({ fireId: null, day: 1, dayCount: 7, playing: false });
   const globeRef = useRef(null);
   const firesRef = useRef([]);
   firesRef.current = fires;
@@ -84,15 +87,48 @@ export default function PublicGlobe({ onOpenCommand }) {
       const gen = ++refreshGeneration;
 
       try {
-        console.log(`${FIRMS_LOG} Refresh tick — requesting live clusters…`);
-        const summaries = await fetchFirmsClusterSummaries(signal);
+        let firmsDrafts = [];
+
+        try {
+          console.log(`${FIRMS_LOG} Page load — requesting FIRMS hotspots (no auto-refresh)…`);
+          const summaries = await fetchFirmsClusterSummaries(signal);
+          if (cancelled || gen !== refreshGeneration) return;
+          firmsDrafts = clusterSummariesToDraftIncidents(summaries);
+          setFiresDemoFallback(false);
+        } catch (err) {
+          if (cancelled || err?.name === "AbortError") return;
+          if (gen !== refreshGeneration) return;
+          console.warn(`${FIRMS_LOG} FIRMS fetch failed — using MOCK_FIRES (demo).`, {
+            reason: err?.message || String(err),
+          });
+          firmsDrafts = enrichDemoMocks(MOCK_FIRES);
+          setFiresDemoFallback(true);
+        }
+
         if (cancelled || gen !== refreshGeneration) return;
 
-        const drafts = clusterSummariesToDraftIncidents(summaries);
+        let cafDrafts = [];
+        try {
+          cafDrafts = await fetchCalFireIncidentDrafts(signal);
+        } catch (cafErr) {
+          if (!cancelled && gen === refreshGeneration && cafErr?.name !== "AbortError") {
+            console.warn(`${FIRMS_LOG} CAL FIRE incident list unavailable (skipped).`, {
+              reason: cafErr?.message || String(cafErr),
+            });
+          }
+        }
+
+        if (cancelled || gen !== refreshGeneration) return;
+
+        const drafts = combineFirmsAndCalDraftsPreferCalFire(firmsDrafts, cafDrafts);
+
         console.log(`${FIRMS_LOG} Mapped to globe incidents`, {
-          pins: drafts.length,
-          source: "NASA FIRMS VIIRS NOAA-20+21 merged",
+          firmsPins: firmsDrafts.length,
+          calFirePins: cafDrafts.length,
+          firmsPinsAfterDedupe: drafts.length - cafDrafts.length,
+          combined: drafts.length,
         });
+
         setFires((prev) => {
           const merged = mergeIncidentSnapshots(prev, drafts);
           queueMicrotask(() =>
@@ -100,25 +136,16 @@ export default function PublicGlobe({ onOpenCommand }) {
           );
           return merged;
         });
-        setFiresDemoFallback(false);
-      } catch (err) {
-        if (cancelled || err?.name === "AbortError" || gen !== refreshGeneration) return;
-        console.warn(`${FIRMS_LOG} Live fetch failed — using MOCK_FIRES (demo).`, {
-          reason: err?.message || String(err),
-        });
-        setFires(enrichDemoMocks(MOCK_FIRES));
-        setFiresDemoFallback(true);
       } finally {
         if (!cancelled && gen === refreshGeneration) setFiresLoading(false);
       }
     };
 
     refresh();
-    const interval = setInterval(refresh, FIRMS_REFRESH_MS);
+
     return () => {
       cancelled = true;
       abortCtl?.abort();
-      clearInterval(interval);
     };
   }, [patchFire]);
 
@@ -126,24 +153,6 @@ export default function PublicGlobe({ onOpenCommand }) {
     if (selectedId && !fires.some((f) => f.id === selectedId)) setSelectedId(null);
   }, [fires, selectedId]);
 
-  // Simulation auto-play
-  useEffect(() => {
-    if (!selectedId) { setSim({ fireId: null, day: 1, dayCount: 7, playing: false }); return; }
-    setSim({ fireId: selectedId, day: 1, dayCount: 7, playing: true });
-  }, [selectedId]);
-
-  useEffect(() => {
-    if (!sim.playing) return;
-    const id = setInterval(() => {
-      setSim((s) => {
-        if (!s.playing) return s;
-        const next = s.day + 0.18;
-        if (next >= s.dayCount) return { ...s, day: s.dayCount, playing: false };
-        return { ...s, day: next };
-      });
-    }, 90);
-    return () => clearInterval(id);
-  }, [sim.playing]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -179,7 +188,6 @@ export default function PublicGlobe({ onOpenCommand }) {
         selectedId={selectedId}
         onSelect={(id) => { setSelectedId(id); setHintVisible(false); }}
         onHover={(id, pos) => { setHoveredId(id); setTooltipPos(pos); }}
-        simulation={sim}
       />
 
       <div className="vignette" />
@@ -295,38 +303,60 @@ export default function PublicGlobe({ onOpenCommand }) {
         </div>
       )}
 
-      {selected && (
-        <div style={{ position: "absolute", bottom: 32, left: 32, zIndex: 25 }}>
-          <FireSimInset
-            fire={selected}
-            simulation={sim}
-            onSimChange={(patch) => setSim((s) => ({ ...s, ...patch }))}
-          />
-        </div>
-      )}
 
       <div className="fade-in" style={{ position: "absolute", bottom: 32, right: 32, zIndex: 20, pointerEvents: "auto" }}>
-        <button
-          onClick={onOpenCommand}
-          style={{
+        {auth ? (
+          <div style={{
             display: "inline-flex", alignItems: "center", gap: 12,
             padding: "12px 18px",
             border: "1px solid var(--hairline-strong)",
             background: "var(--surface-1)",
-            color: "var(--text-primary)",
-            fontFamily: "var(--font-body)",
-            fontSize: 12, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase",
-            cursor: "pointer",
-            transition: "background 180ms var(--ease)",
-            whiteSpace: "nowrap",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface-2)")}
-          onMouseLeave={(e) => (e.currentTarget.style.background = "var(--surface-1)")}
-        >
-          <StatusDot variant="info" size={6} pulse />
-          Open Command Center
-          <span style={{ marginLeft: 4 }}>→</span>
-        </button>
+          }}>
+            <StatusDot variant="info" size={6} pulse />
+            <Mono size={11} color="var(--text-secondary)">{auth.name}</Mono>
+            <button
+              onClick={() => { clearAuth(); navigate("/login", { replace: true }); }}
+              style={{
+                padding: "4px 10px",
+                border: "1px solid var(--hairline)",
+                background: "transparent",
+                color: "var(--text-tertiary)",
+                fontSize: 10,
+                fontWeight: 500,
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+                cursor: "pointer",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface-2)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              Logout
+            </button>
+          </div>
+        ) : (
+          <Link
+            to="/login"
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 12,
+              padding: "12px 18px",
+              border: "1px solid var(--hairline-strong)",
+              background: "var(--surface-1)",
+              color: "var(--text-primary)",
+              fontFamily: "var(--font-body)",
+              fontSize: 12, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase",
+              textDecoration: "none",
+              cursor: "pointer",
+              transition: "background 180ms var(--ease)",
+              whiteSpace: "nowrap",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface-2)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "var(--surface-1)")}
+          >
+            <StatusDot variant="info" size={6} pulse />
+            Sign In as Fire Official
+            <span style={{ marginLeft: 4 }}>→</span>
+          </Link>
+        )}
       </div>
 
       {hintVisible && (

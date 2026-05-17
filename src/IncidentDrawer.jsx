@@ -79,6 +79,24 @@ export default function IncidentDrawer({ fire, onClose }) {
           />
         )}
         {fire.humidityPct != null && <MetricRow label="Humidity" value={fire.humidityPct} unit="%" />}
+        {fire.adminUnit && (
+          <div style={{ padding: "8px 0", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+            <Caption style={{ color: "var(--text-tertiary)" }}>Managing unit</Caption>
+            <Mono size={11} color="var(--text-primary)" weight={500} style={{ textAlign: "right", maxWidth: 280, whiteSpace: "normal", lineHeight: 1.35 }}>
+              {fire.adminUnit}
+            </Mono>
+          </div>
+        )}
+        {fire.incidentDetailUrl && (
+          <a
+            href={fire.incidentDetailUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ display: "block", marginTop: 4, marginBottom: -4, color: "var(--text-secondary)", fontSize: 12 }}
+          >
+            Official incident page →
+          </a>
+        )}
         {(fire.detectedAt || fire.updated_at) && (
           <MetricRow
             label="Detected"

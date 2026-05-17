@@ -1,5 +1,6 @@
 // Stylized 2D operational map (SVG) for the command center MAP tab.
 
+import { useMemo } from "react";
 import { Mono } from "./ui.jsx";
 import { FIRES } from "./data.js";
 
@@ -40,24 +41,30 @@ export default function CommandMap({ layers }) {
     { id: "c01", type: "HAND_CREW", label: "C-01", x: 490, y: 460, status: "ON_SCENE" },
   ];
 
-  const windArrows = [];
-  for (let r = 0; r < 6; r++) {
-    for (let c = 0; c < 9; c++) {
-      windArrows.push({ x: 200 + c * 110, y: 120 + r * 110, angle: -38 });
+  const windArrows = useMemo(() => {
+    const arr = [];
+    for (let r = 0; r < 6; r++) {
+      for (let c = 0; c < 9; c++) {
+        arr.push({ x: 200 + c * 110, y: 120 + r * 110, angle: -38 });
+      }
     }
-  }
+    return arr;
+  }, []);
 
-  const popCells = [];
-  for (let r = 0; r < 12; r++) {
-    for (let c = 0; c < 20; c++) {
-      const x = c * 60, y = r * 60;
-      const d1 = Math.hypot(x - 200, y - 540);
-      const d2 = Math.hypot(x - 640, y - 380);
-      const d3 = Math.hypot(x - 900, y - 480);
-      const v = Math.max(0, 1 - Math.min(d1, d2, d3) / 280);
-      if (v > 0.15) popCells.push({ x, y, v });
+  const popCells = useMemo(() => {
+    const arr = [];
+    for (let r = 0; r < 12; r++) {
+      for (let c = 0; c < 20; c++) {
+        const x = c * 60, y = r * 60;
+        const d1 = Math.hypot(x - 200, y - 540);
+        const d2 = Math.hypot(x - 640, y - 380);
+        const d3 = Math.hypot(x - 900, y - 480);
+        const v = Math.max(0, 1 - Math.min(d1, d2, d3) / 280);
+        if (v > 0.15) arr.push({ x, y, v });
+      }
     }
-  }
+    return arr;
+  }, []);
 
   const roadColor = (s) => ({ OPEN: "#6FCF8E", DEGRADED: "#FFB23F", CLOSED: "#FF4D1C" }[s]);
 

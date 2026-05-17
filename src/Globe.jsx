@@ -4,7 +4,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import * as d3 from "d3";
-import { getBurnPolygon, getProgression, pinSeverityRank, severityColor } from "./data.js";
+import { pinSeverityRank, severityColor } from "./data.js";
 
 const LAND_URL =
   "https://raw.githubusercontent.com/martynafford/natural-earth-geojson/master/110m/physical/ne_110m_land.json";
@@ -52,12 +52,12 @@ function zoomTweenAt(tw, now) {
   return { z, done: t >= 1 };
 }
 
-function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
+function Globe({ fires, selectedId, onSelect, onHover }, ref) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const stateRef = useRef({});
-  const propsRef = useRef({ selectedId, simulation, fires });
-  propsRef.current = { selectedId, simulation, fires };
+  const propsRef = useRef({ selectedId, fires });
+  propsRef.current = { selectedId, fires };
   const [, force] = useState(0);
 
   useImperativeHandle(ref, () => ({
@@ -219,87 +219,30 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
 
       const propsNow = propsRef.current;
       const allFires = propsNow.fires;
-      const sim = propsNow.simulation;
       const selId = propsNow.selectedId;
-
-      // Burn footprint overlay for selected fire
-      if (sim && sim.fireId) {
-        const fire = allFires.find((f) => f.id === sim.fireId);
-        if (fire) {
-          const frames = getProgression(fire);
-          const curIdx = Math.max(0, Math.min(frames.length - 1, Math.floor(sim.day) - 1));
-          for (let i = 0; i <= curIdx; i++) {
-            const frame = frames[i];
-            const poly = getBurnPolygon(fire, frame, 64);
-            const pts = [];
-            let anyVisible = false;
-            for (const [lng, lat] of poly) {
-              const pp = projection([lng, lat]);
-              if (pp) { pts.push(pp); anyVisible = true; }
-            }
-            if (!anyVisible || pts.length < 8) continue;
-            const isCurrent = i === curIdx;
-            const fireColors = ["#FFD66B", "#FFA744", "#FF6F2C", "#FF3D14", "#C82400"];
-            const col = fireColors[Math.min(4, i)];
-
-            ctx.beginPath();
-            ctx.moveTo(pts[0][0], pts[0][1]);
-            for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
-            ctx.closePath();
-            ctx.fillStyle = col + (isCurrent ? "44" : "22");
-            ctx.fill();
-            ctx.strokeStyle = col + (isCurrent ? "ee" : "55");
-            ctx.lineWidth = isCurrent ? 1.6 : 0.7;
-            if (!isCurrent) ctx.setLineDash([3, 3]);
-            ctx.stroke();
-            ctx.setLineDash([]);
-          }
-
-          const center = projection([fire.lng, fire.lat]);
-          if (center) {
-            const f = frames[curIdx];
-            ctx.font = '600 10px "JetBrains Mono", monospace';
-            ctx.textAlign = "left";
-            const lx = center[0] + 18, ly = center[1] - 28;
-            ctx.strokeStyle = "rgba(244,241,235,0.45)";
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(center[0], center[1]);
-            ctx.lineTo(lx - 2, ly + 8);
-            ctx.stroke();
-            const tag = `DAY ${f.day}  ·  ${f.acres.toLocaleString()} ac`;
-            const tw = ctx.measureText(tag).width + 16;
-            ctx.fillStyle = "rgba(28,26,23,0.92)";
-            ctx.strokeStyle = "rgba(58,53,48,1)";
-            ctx.fillRect(lx, ly - 6, tw, 18);
-            ctx.strokeRect(lx + 0.5, ly - 6 + 0.5, tw - 1, 17);
-            ctx.fillStyle = "#F4F1EB";
-            ctx.fillText(tag, lx + 8, ly + 6);
-          }
-        }
-      }
 
       // Fire pins
       const visiblePins = [];
       for (const f of allFires) {
         const p = projection([f.lng, f.lat]);
         if (!p) continue;
-        visiblePins.push({ f, x: p[0], y: p[1] });
+        const sev = pinSeverityRank(f);
+        visiblePins.push({ f, x: p[0], y: p[1], sev, col: severityColor(sev) });
       }
       s.visiblePins = visiblePins;
 
-      for (const { f, x, y } of visiblePins) {
-        const sev = pinSeverityRank(f);
-        const col = severityColor(sev);
+      for (const { x, y, sev, col } of visiblePins) {
         const haloR = 6 + sev * 2.2;
-        const g = ctx.createRadialGradient(x, y, 0, x, y, haloR);
-        g.addColorStop(0, col + "cc");
-        g.addColorStop(0.5, col + "55");
-        g.addColorStop(1, col + "00");
-        ctx.fillStyle = g;
+        ctx.fillStyle = col;
+        ctx.globalAlpha = 0.22;
         ctx.beginPath();
         ctx.arc(x, y, haloR, 0, Math.PI * 2);
         ctx.fill();
+        ctx.globalAlpha = 0.55;
+        ctx.beginPath();
+        ctx.arc(x, y, haloR * 0.45, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
 
       const t = performance.now() / 1000;
@@ -315,9 +258,7 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
         ctx.stroke();
       }
 
-      for (const { f, x, y } of visiblePins) {
-        const sev = pinSeverityRank(f);
-        const col = severityColor(sev);
+      for (const { x, y, sev, col } of visiblePins) {
         const pr = 2.2 + sev * 0.5;
         ctx.beginPath();
         ctx.arc(x, y, pr + 1.6, 0, Math.PI * 2);
@@ -414,6 +355,9 @@ function Globe({ fires, selectedId, onSelect, onHover, simulation }, ref) {
       stateRef.current.downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
     }
     function onPointerMove(e) {
+      const now = performance.now();
+      if (now - (stateRef.current.lastMoveAt || 0) < 16) return;
+      stateRef.current.lastMoveAt = now;
       const rect = canvas.getBoundingClientRect();
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       if (stateRef.current.dragging) {

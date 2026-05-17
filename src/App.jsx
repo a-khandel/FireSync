@@ -1,8 +1,12 @@
 // FireSync — root app
 
 import { useEffect, useState } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
 import PublicGlobe from "./PublicGlobe.jsx";
 import CommandCenter from "./CommandCenter.jsx";
+import LoginPage from "./LoginPage.jsx";
+import FiresListPage from "./FiresListPage.jsx";
+import { isAuthenticated } from "./auth.js";
 import { Mono } from "./ui.jsx";
 
 const STAGES = [
@@ -62,22 +66,38 @@ function LoadingSplash({ onDone }) {
   );
 }
 
+function ProtectedRoute({ children }) {
+  return isAuthenticated() ? children : <Navigate to="/login" replace />;
+}
+
 export default function App() {
-  const [view, setView] = useState("public");
   const [loading, setLoading] = useState(true);
 
   return (
     <>
       {loading && <LoadingSplash onDone={() => setLoading(false)} />}
       {!loading && (
-        <>
-          <div style={{ position: "absolute", inset: 0, display: view === "public" ? "block" : "none" }}>
-            <PublicGlobe onOpenCommand={() => setView("command")} />
-          </div>
-          <div style={{ position: "absolute", inset: 0, display: view === "command" ? "block" : "none" }}>
-            <CommandCenter onClose={() => setView("public")} />
-          </div>
-        </>
+        <Routes>
+          <Route path="/" element={<PublicGlobe />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route
+            path="/fires"
+            element={
+              <ProtectedRoute>
+                <FiresListPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/dashboard/santa-rosa-island"
+            element={
+              <ProtectedRoute>
+                <CommandCenter />
+              </ProtectedRoute>
+            }
+          />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       )}
     </>
   );
